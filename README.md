@@ -5,6 +5,7 @@ App web instalável (PWA) que gera imagens a partir de texto **inteiramente no s
 ## Requisitos do aparelho
 
 - Navegador com WebGPU e suporte a `shader-f16`: **Chrome no Android 12+** ou **Safari no iOS 26+**.
+- Em Samsung com Exynos (testado: Galaxy S24 FE, GPU Xclipse 940) o WebGPU só aparece depois de ativar `chrome://flags/#enable-unsafe-webgpu` e reiniciar o Chrome.
 - Cerca de **6 GB de RAM ou mais** (use o "Modo econômico de memória" em aparelhos com pouca RAM).
 - ~2,4 GB livres para o modelo, baixado uma única vez (use Wi-Fi). Ele fica no armazenamento privado do navegador (OPFS).
 - Na primeira geração é preciso internet para buscar o tokenizador (arquivos pequenos, depois ficam em cache).
