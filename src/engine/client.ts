@@ -52,8 +52,8 @@ export function createWorkerEngine(): Engine {
 
   return {
     async status(): Promise<ModelStatus> {
-      const r = await call<{ downloaded: boolean; usage: number }>({ type: 'status' });
-      return { downloaded: r.downloaded, usage: r.usage };
+      const r = await call<{ downloaded: boolean; usage: number; partial: number }>({ type: 'status' });
+      return { downloaded: r.downloaded, usage: r.usage, partial: r.partial };
     },
     download(onProgress, signal) {
       return new Promise<void>((resolve, reject) => {

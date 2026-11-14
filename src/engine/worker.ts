@@ -56,8 +56,9 @@ const LABEL: Record<Kind, string> = {
 const cache: Partial<Record<Kind, ort.InferenceSession>> = {};
 
 async function createSession(kind: Kind, stage: (s: string) => void): Promise<ort.InferenceSession> {
-  stage(`Carregando ${LABEL[kind]}…`);
+  stage(`Lendo ${FILE_OF[kind]} do armazenamento…`);
   const bytes = await store.readFile(FILE_OF[kind]);
+  stage(`Criando sessão: ${LABEL[kind]}…`);
   const opts = { ...BASE_SESSION_OPTS, freeDimensionOverrides: OVERRIDES[kind] };
   return ort.InferenceSession.create(bytes, opts as ort.InferenceSession.SessionOptions);
 }
@@ -138,7 +139,7 @@ async function generate(id: number, prompt: string, seed: number, lowMemory: boo
   }
   if (lowMemory) await releaseAll();
 
-  stage('Lendo o prompt…');
+  stage('Lendo o prompt (tokenizador)…');
   const ids = await tokenize(prompt);
 
   // No modo econômico, uma falha no meio não pode deixar a sessão (e a memória da GPU) presa.
@@ -153,14 +154,14 @@ async function generate(id: number, prompt: string, seed: number, lowMemory: boo
   async function runPipeline() {
   // 1) texto
   session = await getSession('text_encoder', lowMemory, stage);
-  stage('Codificando o texto…');
+  stage('Executando: codificador de texto (1/3)…');
   const te = await session.run({ input_ids: new ort.Tensor('int32', ids, [1, 77]) });
   const hidden = await tensorToCpu(te['last_hidden_state']);
   if (lowMemory) await session.release();
 
   // 2) unet
   session = await getSession('unet', lowMemory, stage);
-  stage('Criando a imagem…');
+  stage('Executando: U-Net (2/3)…');
   const latents = makeLatents(seed >>> 0, SIGMA);
   const sample = scaleInput(latents, SIGMA);
   const un = await session.run({
@@ -173,7 +174,7 @@ async function generate(id: number, prompt: string, seed: number, lowMemory: boo
 
   // 3) vae
   session = await getSession('vae_decoder', lowMemory, stage);
-  stage('Decodificando a imagem…');
+  stage('Executando: decodificador de imagem (3/3)…');
   const x0 = stepToX0(latents, eps, SIGMA, VAE_SCALE);
   const vo = await session.run({ latent_sample: new ort.Tensor('float32', x0, [1, 4, 64, 64]) });
   const img = toFloat32(await vo['sample'].getData(true));
@@ -196,7 +197,6 @@ async function download(id: number) {
     post({ id, type: 'downloaded' });
   } catch (e) {
     if ((e as DOMException)?.name === 'AbortError') {
-      await store.cleanPartials().catch(() => undefined);
       post({ id, type: 'error', code: 'aborted', message: 'Download cancelado.' });
       return;
     }
@@ -219,7 +219,7 @@ ctx.onmessage = async (e) => {
         dlAbort?.abort();
         return;
       case 'status':
-        post({ id: m.id, type: 'status', downloaded: await store.isDownloaded(), usage: await store.usage() });
+        post({ id: m.id, type: 'status', downloaded: await store.isDownloaded(), usage: await store.usage(), partial: await store.partialBytes() });
         return;
       case 'download':
         await download(m.id);

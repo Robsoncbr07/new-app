@@ -12,7 +12,7 @@ export function createMockEngine(): Engine {
   };
   return {
     async status() {
-      return { downloaded: get(), usage: get() ? 2420 * 1024 * 1024 : 0 };
+      return { downloaded: get(), usage: get() ? 2420 * 1024 * 1024 : 0, partial: 0 };
     },
     async download(onProgress, signal) {
       const total = 2420 * 1024 * 1024;

@@ -65,6 +65,14 @@ export async function usage(): Promise<number> {
   return total;
 }
 
+/** Bytes já salvos em arquivos .part (download interrompido que pode continuar). */
+export async function partialBytes(): Promise<number> {
+  const d = await dir();
+  let total = 0;
+  for (const f of FILES) total += await sizeOf(d, f.name + '.part');
+  return total;
+}
+
 export async function deleteAll(): Promise<void> {
   const root = await navigator.storage.getDirectory();
   try {
@@ -130,6 +138,31 @@ async function finalize(d: FileSystemDirectoryHandle, name: string): Promise<voi
   await d.removeEntry(name + '.part');
 }
 
+const FLUSH_EVERY = 16 * MB;
+
+/**
+ * Total real do arquivo. Content-Range pode não ser legível em resposta de outra origem
+ * (depende de Access-Control-Expose-Headers), mas Content-Length sempre é: num 206 o total
+ * é o que já temos mais o que ainda vem.
+ */
+function totalOf(resp: Response, offset: number): number {
+  const cr = resp.headers.get('Content-Range');
+  const m = cr && /\/(\d+)\s*$/.exec(cr);
+  if (m) return parseInt(m[1], 10);
+  const cl = parseInt(resp.headers.get('Content-Length') ?? '', 10);
+  if (!Number.isFinite(cl)) return 0;
+  return resp.status === 206 ? offset + cl : cl;
+}
+
+async function request(f: ModelFile, offset: number, signal: AbortSignal): Promise<Response> {
+  try {
+    return await fetch(BASE_URL + f.remote, { signal, headers: offset > 0 ? { Range: `bytes=${offset}-` } : {} });
+  } catch (e) {
+    if ((e as DOMException).name === 'AbortError') throw e;
+    throw new EngineError('download', 'Falha ao baixar o modelo. Verifique sua conexão e tente novamente: o download continua de onde parou.');
+  }
+}
+
 async function downloadOne(
   d: FileSystemDirectoryHandle,
   f: ModelFile,
@@ -138,57 +171,70 @@ async function downloadOne(
   onProgress: (p: DownloadProgress) => void,
   signal: AbortSignal,
 ): Promise<number> {
-  let resp: Response;
-  try {
-    resp = await fetch(BASE_URL + f.remote, { signal });
-  } catch (e) {
-    if ((e as DOMException).name === 'AbortError') throw e;
-    throw new EngineError('download', 'Falha ao baixar o modelo. Verifique sua conexão e tente novamente.');
+  const partName = f.name + '.part';
+  let offset = await sizeOf(d, partName);
+  let resp = await request(f, offset, signal);
+  if (resp.status === 416) {
+    // Parcial suspeito. Se o tamanho dele já é o total, só falta finalizar; senão recomeça do zero.
+    const m = /\*\/(\d+)/.exec(resp.headers.get('Content-Range') ?? '');
+    if (m && offset > 0 && parseInt(m[1], 10) === offset) {
+      await finalize(d, f.name);
+      return offset;
+    }
+    await d.removeEntry(partName).catch(() => undefined);
+    offset = 0;
+    resp = await request(f, 0, signal);
   }
   if (!resp.ok || !resp.body) {
     throw new EngineError('download', `Falha ao baixar o modelo (HTTP ${resp.status}). Tente novamente mais tarde.`);
   }
-  const lenHeader = resp.headers.get('Content-Length');
-  const expected = lenHeader ? parseInt(lenHeader, 10) : 0;
-  const fileTotal = expected || f.approx;
+  const resume = resp.status === 206 && offset > 0;
+  if (!resume) offset = 0; // 200: o servidor ignorou o Range; recomeça do zero
+  const total = totalOf(resp, offset);
+  const fileTotal = total || f.approx;
 
-  const partFh = await d.getFileHandle(f.name + '.part', { create: true });
+  const partFh = await d.getFileHandle(partName, { create: true });
   const access = await (partFh as any).createSyncAccessHandle();
-  let written = 0;
+  let written = offset;
+  let sinceFlush = 0;
   let lastReport = 0;
+  const report = () => onProgress({
+    file: f.name,
+    fileLoaded: written,
+    fileTotal,
+    loaded: doneBefore + written,
+    total: Math.max(grandTotalApprox, doneBefore + fileTotal),
+  });
   try {
-    access.truncate(0);
+    if (!resume) access.truncate(0);
+    report();
     const reader = resp.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       access.write(value, { at: written });
       written += value.byteLength;
+      sinceFlush += value.byteLength;
+      if (sinceFlush >= FLUSH_EVERY) {
+        access.flush(); // garante que os bytes sobrevivem se a aba for morta
+        sinceFlush = 0;
+      }
       const now = performance.now();
       if (now - lastReport > 150) {
         lastReport = now;
-        onProgress({
-          file: f.name,
-          fileLoaded: written,
-          fileTotal,
-          loaded: doneBefore + written,
-          total: Math.max(grandTotalApprox, doneBefore + fileTotal),
-        });
+        report();
       }
     }
-    access.flush();
   } catch (e) {
-    access.close();
     if ((e as DOMException).name === 'AbortError') throw e;
-    throw new EngineError('download', 'A conexão caiu durante o download. Tente novamente (o arquivo parcial será refeito).');
+    throw new EngineError('download', 'A conexão caiu durante o download. Toque em "Continuar download": o que já foi baixado está salvo.');
+  } finally {
+    try { access.flush(); } catch { /* ignore */ }
+    access.close();
   }
-  access.close();
 
-  if (expected && written !== expected) {
-    throw new EngineError('download', 'Download incompleto (tamanho diferente do esperado). Tente novamente.');
-  }
-  if (!expected && written < f.approx * 0.5) {
-    throw new EngineError('download', 'Download incompleto. Tente novamente.');
+  if (total ? written !== total : written < f.approx * 0.5) {
+    throw new EngineError('download', 'Download incompleto. Toque em "Continuar download" para tentar de novo.');
   }
   await finalize(d, f.name);
   onProgress({
@@ -214,10 +260,4 @@ export async function download(
     }
     done += await downloadOne(d, f, done, approxTotal, onProgress, signal);
   }
-}
-
-/** Remove restos parciais (usado ao cancelar). */
-export async function cleanPartials(): Promise<void> {
-  const d = await dir();
-  for (const f of FILES) await d.removeEntry(f.name + '.part').catch(() => undefined);
 }

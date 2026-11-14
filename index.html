@@ -23,18 +23,31 @@
       <p>Em celulares Samsung com chip Exynos (como o Galaxy S24 FE) o WebGPU vem desligado: abra <code>chrome://flags</code>, ative <strong>Unsafe WebGPU Support</strong>, toque em Relaunch e volte aqui.</p>
     </section>
 
+    <section id="crash-notice" class="card notice" hidden>
+      <strong>A última tentativa foi interrompida em: <span id="crash-stage"></span></strong>
+      <p>O navegador fechou a página durante essa etapa, geralmente por falta de memória. Ative o "Modo econômico de memória", feche outros apps e tente de novo. O download, se houver, continua de onde parou.</p>
+      <div class="row gap wrap">
+        <button id="btn-crash-copy" class="btn" type="button">Copiar diagnóstico</button>
+        <button id="btn-crash-dismiss" class="btn" type="button">Dispensar</button>
+      </div>
+      <textarea id="crash-text" rows="6" readonly hidden></textarea>
+    </section>
+
     <section id="model-card" class="card">
       <div id="model-missing" hidden>
         <h2>Modelo de imagem</h2>
         <p class="muted">Baixar modelo (~2,4 GB, só uma vez, use Wi-Fi). Ele fica salvo no aparelho e funciona sem internet depois.</p>
+        <p id="dl-saved" class="muted small" hidden></p>
         <button id="btn-download" class="btn primary">Baixar modelo</button>
+        <p class="hint">Mantenha o app aberto e a tela ligada durante o download.</p>
         <div id="dl-progress" hidden>
           <div class="bar"><div id="dl-bar" class="bar-fill"></div></div>
           <div class="row between small">
             <span id="dl-text">0 MB (0%)</span>
-            <button id="btn-cancel" class="link">Cancelar</button>
+            <button id="btn-cancel" class="link">Pausar</button>
           </div>
         </div>
+        <button id="btn-discard" class="link danger" hidden>Descartar download parcial</button>
       </div>
       <div id="model-ready" hidden>
         <div class="row between">

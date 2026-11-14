@@ -9,6 +9,8 @@ export interface DownloadProgress {
 export interface ModelStatus {
   downloaded: boolean;
   usage: number;
+  /** bytes já salvos de um download interrompido (arquivos .part) */
+  partial: number;
 }
 
 export interface GenerateRequest {
@@ -51,7 +53,7 @@ export type WorkerRequest =
   | { id: number; type: 'deleteModel' };
 
 export type WorkerReply =
-  | { id: number; type: 'status'; downloaded: boolean; usage: number }
+  | { id: number; type: 'status'; downloaded: boolean; usage: number; partial: number }
   | { id: number; type: 'progress'; stage: string }
   | { id: number; type: 'downloadProgress'; progress: DownloadProgress }
   | { id: number; type: 'downloaded' }
