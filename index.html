@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1115" />
+  <meta name="description" content="Gere imagens a partir de texto direto no seu celular, sem nuvem, com WebGPU." />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" type="image/png" href="./icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+  <title>Ateliê Local</title>
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <h1>Ateliê Local</h1>
+      <span id="gpu-chip" class="chip status" role="status">Verificando WebGPU…</span>
+    </header>
+
+    <section id="gpu-notice" class="card notice" hidden>
+      <strong>WebGPU indisponível</strong>
+      <p>Este app precisa de WebGPU: use o Chrome no Android 12 ou superior, ou o Safari no iOS 26 ou superior, em um aparelho com cerca de 6 GB de RAM ou mais.</p>
+    </section>
+
+    <section id="model-card" class="card">
+      <div id="model-missing" hidden>
+        <h2>Modelo de imagem</h2>
+        <p class="muted">Baixar modelo (~2,4 GB, só uma vez, use Wi-Fi). Ele fica salvo no aparelho e funciona sem internet depois.</p>
+        <button id="btn-download" class="btn primary">Baixar modelo</button>
+        <div id="dl-progress" hidden>
+          <div class="bar"><div id="dl-bar" class="bar-fill"></div></div>
+          <div class="row between small">
+            <span id="dl-text">0 MB (0%)</span>
+            <button id="btn-cancel" class="link">Cancelar</button>
+          </div>
+        </div>
+      </div>
+      <div id="model-ready" hidden>
+        <div class="row between">
+          <div>
+            <h2>Modelo pronto</h2>
+            <p id="model-usage" class="muted small"></p>
+          </div>
+          <button id="btn-remove" class="link danger">Remover modelo</button>
+        </div>
+      </div>
+      <p id="model-error" class="error" role="alert" hidden></p>
+    </section>
+
+    <section class="card">
+      <label for="prompt" class="label">Descreva a imagem</label>
+      <textarea id="prompt" rows="3" placeholder="a cozy cabin in a snowy forest, golden hour" maxlength="400"></textarea>
+      <p class="hint">Dica: escreva em inglês. O modelo foi treinado com textos em inglês e entende melhor.</p>
+
+      <div id="styles" class="chips" aria-label="Estilos"></div>
+
+      <div class="row gap">
+        <div class="seed-wrap">
+          <label for="seed" class="label">Semente</label>
+          <div class="row">
+            <input id="seed" type="number" inputmode="numeric" min="0" max="4294967295" step="1" />
+            <button id="btn-dice" class="btn icon" type="button" aria-label="Semente aleatória" title="Semente aleatória">🎲</button>
+          </div>
+        </div>
+      </div>
+
+      <label class="toggle">
+        <input id="low-mem" type="checkbox" />
+        <span class="track"></span>
+        <span class="toggle-text">Modo econômico de memória<small>Mais lento, mas evita travar em aparelhos com pouca RAM.</small></span>
+      </label>
+
+      <button id="btn-generate" class="btn primary big" disabled>Gerar</button>
+      <p id="stage" class="stage" role="status" aria-live="polite" hidden></p>
+      <p id="gen-error" class="error" role="alert" hidden></p>
+    </section>
+
+    <section id="result" class="card" hidden>
+      <canvas id="canvas" width="512" height="512" aria-label="Imagem gerada"></canvas>
+      <p id="elapsed" class="muted small center"></p>
+      <div class="row gap wrap">
+        <button id="btn-save" class="btn">Salvar</button>
+        <button id="btn-share" class="btn" hidden>Compartilhar</button>
+        <button id="btn-vary" class="btn">Variar</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Galeria</h2>
+      <p id="gallery-empty" class="muted small">As imagens que você gerar aparecem aqui (até 50).</p>
+      <div id="gallery" class="grid"></div>
+    </section>
+
+    <footer class="foot muted small">Tudo roda no seu aparelho. Nenhum prompt ou imagem sai dele.</footer>
+  </main>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
