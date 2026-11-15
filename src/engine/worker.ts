@@ -55,16 +55,25 @@ const LABEL: Record<Kind, string> = {
 
 const cache: Partial<Record<Kind, ort.InferenceSession>> = {};
 
-async function createSession(kind: Kind, stage: (s: string) => void): Promise<ort.InferenceSession> {
+// No modo econômico o codificador de texto (o maior arquivo, ~1,7 GB) roda na CPU: no
+// Galaxy S24 FE a aba era derrubada ao executá-lo na GPU. Fica mais lento, mas não disputa
+// memória de vídeo com o resto do pipeline.
+const onCpu = (kind: Kind, lowMemory: boolean) => lowMemory && kind === 'text_encoder';
+
+async function createSession(kind: Kind, stage: (s: string) => void, cpu = false): Promise<ort.InferenceSession> {
   stage(`Lendo ${FILE_OF[kind]} do armazenamento…`);
   const bytes = await store.readFile(FILE_OF[kind]);
-  stage(`Criando sessão: ${LABEL[kind]}…`);
-  const opts = { ...BASE_SESSION_OPTS, freeDimensionOverrides: OVERRIDES[kind] };
+  stage(`Criando sessão: ${LABEL[kind]}${cpu ? ' (CPU)' : ''}…`);
+  const opts = {
+    ...BASE_SESSION_OPTS,
+    executionProviders: [cpu ? 'wasm' : 'webgpu'],
+    freeDimensionOverrides: OVERRIDES[kind],
+  };
   return ort.InferenceSession.create(bytes, opts as ort.InferenceSession.SessionOptions);
 }
 
 async function getSession(kind: Kind, lowMemory: boolean, stage: (s: string) => void) {
-  if (lowMemory) return createSession(kind, stage);
+  if (lowMemory) return createSession(kind, stage, onCpu(kind, lowMemory));
   let s = cache[kind];
   if (!s) {
     s = await createSession(kind, stage);
@@ -154,7 +163,7 @@ async function generate(id: number, prompt: string, seed: number, lowMemory: boo
   async function runPipeline() {
   // 1) texto
   session = await getSession('text_encoder', lowMemory, stage);
-  stage('Executando: codificador de texto (1/3)…');
+  stage(lowMemory ? 'Executando: codificador de texto na CPU (1/3), pode levar até um minuto…' : 'Executando: codificador de texto (1/3)…');
   const te = await session.run({ input_ids: new ort.Tensor('int32', ids, [1, 77]) });
   const hidden = await tensorToCpu(te['last_hidden_state']);
   if (lowMemory) await session.release();
