@@ -42,6 +42,13 @@ export function scaleInput(latents: Float32Array, sigma: number = SIGMA): Float3
   return out;
 }
 
+/** Completa (com padId) ou corta os ids até exatamente `len` posições. */
+export function padTokenIds(ids: ArrayLike<number | bigint>, len: number, padId: number): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < len; i++) out.push(i < ids.length ? Number(ids[i]) : padId);
+  return out;
+}
+
 /** (latents - sigma * eps) / vaeScale  -> entrada do decodificador VAE. */
 export function stepToX0(
   latents: Float32Array,

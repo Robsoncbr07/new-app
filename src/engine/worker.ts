@@ -2,8 +2,9 @@
 import * as ort from 'onnxruntime-web/webgpu';
 import * as store from './modelStore';
 import {
-  SIGMA, VAE_SCALE, makeLatents, scaleInput, stepToX0, toRGBA, toFloat32,
+  makeLatents, scaleInput, stepToX0, toRGBA, toFloat32, padTokenIds,
 } from './scheduler';
+import { getModel, type Kind, type ModelId, type ModelSpec } from './models';
 import { EngineError, type WorkerRequest, type WorkerReply } from './types';
 
 const ctx = self as unknown as {
@@ -35,55 +36,46 @@ const BASE_SESSION_OPTS = {
   },
 };
 
-type Kind = 'text_encoder' | 'unet' | 'vae_decoder';
-const FILE_OF: Record<Kind, string> = {
-  text_encoder: 'text_encoder.onnx',
-  unet: 'unet.onnx',
-  vae_decoder: 'vae_decoder.onnx',
-};
-const OVERRIDES: Record<Kind, Record<string, number>> = {
-  text_encoder: { batch_size: 1 },
-  unet: { batch_size: 1, num_channels: 4, height: 64, width: 64, sequence_length: 77 },
-  vae_decoder: { batch_size: 1, num_channels_latent: 4, height_latent: 64, width_latent: 64 },
-};
-
 const LABEL: Record<Kind, string> = {
   text_encoder: 'codificador de texto',
   unet: 'U-Net',
   vae_decoder: 'decodificador de imagem',
 };
 
-const cache: Partial<Record<Kind, ort.InferenceSession>> = {};
+// Sessões em cache (só no modo normal), por modelo e tipo. Todas rodam na GPU (WebGPU).
+const cache: Partial<Record<string, ort.InferenceSession>> = {};
+const cacheKey = (m: ModelSpec, kind: Kind) => `${m.id}/${kind}`;
 
-// No modo econômico o codificador de texto (o maior arquivo, ~1,7 GB) roda na CPU: no
-// Galaxy S24 FE a aba era derrubada ao executá-lo na GPU. Fica mais lento, mas não disputa
-// memória de vídeo com o resto do pipeline.
-const onCpu = (kind: Kind, lowMemory: boolean) => lowMemory && kind === 'text_encoder';
-
-async function createSession(kind: Kind, stage: (s: string) => void, cpu = false): Promise<ort.InferenceSession> {
-  stage(`Lendo ${FILE_OF[kind]} do armazenamento…`);
-  const bytes = await store.readFile(FILE_OF[kind]);
-  stage(`Criando sessão: ${LABEL[kind]}${cpu ? ' (CPU)' : ''}…`);
-  const opts = {
-    ...BASE_SESSION_OPTS,
-    executionProviders: [cpu ? 'wasm' : 'webgpu'],
-    freeDimensionOverrides: OVERRIDES[kind],
-  };
-  return ort.InferenceSession.create(bytes, opts as ort.InferenceSession.SessionOptions);
+async function createSession(m: ModelSpec, kind: Kind, stage: (s: string) => void): Promise<ort.InferenceSession> {
+  const file = m.files.find((f) => f.kind === kind)!;
+  stage(`Lendo ${file.name} do armazenamento…`);
+  // Os bytes lidos do OPFS vivem só dentro desta função: o ORT copia para a memória do wasm
+  // durante create() e libera essa cópia ao terminar; aqui soltamos a referência logo depois
+  // para a cópia em JS poder ser coletada antes da próxima etapa.
+  let bytes: Uint8Array | null = await store.readFile(m, file.name);
+  stage(`Criando sessão: ${LABEL[kind]}…`);
+  const opts = { ...BASE_SESSION_OPTS, freeDimensionOverrides: m.pipeline.overrides[kind] };
+  try {
+    return await ort.InferenceSession.create(bytes, opts as ort.InferenceSession.SessionOptions);
+  } finally {
+    bytes = null;
+  }
 }
 
-async function getSession(kind: Kind, lowMemory: boolean, stage: (s: string) => void) {
-  if (lowMemory) return createSession(kind, stage, onCpu(kind, lowMemory));
-  let s = cache[kind];
+async function getSession(m: ModelSpec, kind: Kind, lowMemory: boolean, stage: (s: string) => void) {
+  if (lowMemory) return createSession(m, kind, stage);
+  const key = cacheKey(m, kind);
+  let s = cache[key];
   if (!s) {
-    s = await createSession(kind, stage);
-    cache[kind] = s;
+    s = await createSession(m, kind, stage);
+    cache[key] = s;
   }
   return s;
 }
 
-async function releaseAll() {
-  for (const k of Object.keys(cache) as Kind[]) {
+async function releaseAll(exceptModel?: ModelId) {
+  for (const k of Object.keys(cache)) {
+    if (exceptModel && k.startsWith(exceptModel + '/')) continue;
     try { await cache[k]!.release(); } catch { /* ignore */ }
     delete cache[k];
   }
@@ -91,19 +83,18 @@ async function releaseAll() {
 
 // ---------- tokenizer ----------
 let tokenizer: any = null;
-async function tokenize(prompt: string): Promise<Int32Array> {
-  if (!tokenizer) {
+let tokenizerRepo = '';
+async function tokenize(m: ModelSpec, prompt: string): Promise<number[]> {
+  if (!tokenizer || tokenizerRepo !== m.tokenizerRepo) {
     const { AutoTokenizer, env } = await import('@huggingface/transformers');
     env.allowLocalModels = false;
     env.useBrowserCache = true;
-    tokenizer = await AutoTokenizer.from_pretrained('Xenova/clip-vit-base-patch16');
-    tokenizer.pad_token_id = 0;
+    tokenizer = await AutoTokenizer.from_pretrained(m.tokenizerRepo);
+    tokenizerRepo = m.tokenizerRepo;
   }
-  const enc = tokenizer(prompt, { padding: 'max_length', max_length: 77, truncation: true, return_tensor: false });
-  let ids: number[] = Array.from(enc.input_ids as ArrayLike<number | bigint>, (v) => Number(v));
-  if (ids.length > 77) ids = ids.slice(0, 77);
-  while (ids.length < 77) ids.push(0);
-  return Int32Array.from(ids);
+  // Sem padding do tokenizador: preenchemos nós mesmos com o token certo de cada modelo.
+  const enc = tokenizer(prompt, { padding: false, truncation: true, max_length: 77, return_tensor: false });
+  return padTokenIds(enc.input_ids as ArrayLike<number | bigint>, 77, m.pipeline.padTokenId);
 }
 
 // ---------- erros ----------
@@ -139,17 +130,21 @@ async function tensorToCpu(t: ort.Tensor): Promise<ort.Tensor> {
   return new ort.Tensor(t.type as any, (data as any).slice(), t.dims as number[]);
 }
 
-async function generate(id: number, prompt: string, seed: number, lowMemory: boolean) {
+async function generate(id: number, modelId: ModelId, prompt: string, seed: number, lowMemory: boolean) {
   const t0 = performance.now();
-  const stage = (s: string) => post({ id, type: 'progress', stage: s });
+  const m = getModel(modelId);
+  const P = m.pipeline;
+  const stage = (s: string) => post({ id, type: 'progress', stage: `${m.name}: ${s}` });
   await checkWebGPU();
-  if (!(await store.isDownloaded())) {
+  if (!(await store.isDownloaded(m))) {
     throw new EngineError('no-model', 'O modelo ainda não foi baixado.');
   }
-  if (lowMemory) await releaseAll();
+  // Um modelo por vez na memória: no modo econômico nada fica em cache; no normal, trocar de
+  // modelo descarta as sessões do anterior.
+  await releaseAll(lowMemory ? undefined : m.id);
 
   stage('Lendo o prompt (tokenizador)…');
-  const ids = await tokenize(prompt);
+  const ids = await tokenize(m, prompt);
 
   // No modo econômico, uma falha no meio não pode deixar a sessão (e a memória da GPU) presa.
   let session: ort.InferenceSession | null = null;
@@ -162,31 +157,37 @@ async function generate(id: number, prompt: string, seed: number, lowMemory: boo
 
   async function runPipeline() {
   // 1) texto
-  session = await getSession('text_encoder', lowMemory, stage);
-  stage(lowMemory ? 'Executando: codificador de texto na CPU (1/3), pode levar até um minuto…' : 'Executando: codificador de texto (1/3)…');
-  const te = await session.run({ input_ids: new ort.Tensor('int32', ids, [1, 77]) });
-  const hidden = await tensorToCpu(te['last_hidden_state']);
+  session = await getSession(m, 'text_encoder', lowMemory, stage);
+  stage('Executando: codificador de texto (1/3)…');
+  const idsTensor = P.textIdsType === 'int64'
+    ? new ort.Tensor('int64', BigInt64Array.from(ids, (v) => BigInt(v)), [1, 77])
+    : new ort.Tensor('int32', Int32Array.from(ids), [1, 77]);
+  const te = await session.run({ input_ids: idsTensor });
+  const hidden = await tensorToCpu(te[P.textOutput]);
   if (lowMemory) await session.release();
 
   // 2) unet
-  session = await getSession('unet', lowMemory, stage);
+  session = await getSession(m, 'unet', lowMemory, stage);
   stage('Executando: U-Net (2/3)…');
-  const latents = makeLatents(seed >>> 0, SIGMA);
-  const sample = scaleInput(latents, SIGMA);
+  const latents = makeLatents(seed >>> 0, P.sigma);
+  const sample = scaleInput(latents, P.sigma);
+  const timestep = P.timestepType === 'int64'
+    ? new ort.Tensor('int64', BigInt64Array.from([BigInt(P.timestep)]), [1])
+    : new ort.Tensor('float32', Float32Array.from([P.timestep]), [1]);
   const un = await session.run({
     sample: new ort.Tensor('float32', sample, [1, 4, 64, 64]),
-    timestep: new ort.Tensor('int64', BigInt64Array.from([999n]), [1]),
+    timestep,
     encoder_hidden_states: hidden,
   });
-  const eps = toFloat32(await un['out_sample'].getData(true));
+  const eps = toFloat32(await un[P.unetOutput].getData(true));
   if (lowMemory) await session.release();
 
   // 3) vae
-  session = await getSession('vae_decoder', lowMemory, stage);
+  session = await getSession(m, 'vae_decoder', lowMemory, stage);
   stage('Executando: decodificador de imagem (3/3)…');
-  const x0 = stepToX0(latents, eps, SIGMA, VAE_SCALE);
-  const vo = await session.run({ latent_sample: new ort.Tensor('float32', x0, [1, 4, 64, 64]) });
-  const img = toFloat32(await vo['sample'].getData(true));
+  const x0 = stepToX0(latents, eps, P.sigma, P.vaeScale);
+  const vo = await session.run({ [P.vaeInput]: new ort.Tensor('float32', x0, [1, 4, 64, 64]) });
+  const img = toFloat32(await vo[P.vaeOutput].getData(true));
   if (lowMemory) await session.release();
 
   stage('Finalizando…');
@@ -199,10 +200,10 @@ async function generate(id: number, prompt: string, seed: number, lowMemory: boo
 // ---------- download ----------
 let dlAbort: AbortController | null = null;
 
-async function download(id: number) {
+async function download(id: number, modelId: ModelId) {
   dlAbort = new AbortController();
   try {
-    await store.download((progress) => post({ id, type: 'downloadProgress', progress }), dlAbort.signal);
+    await store.download(getModel(modelId), (progress) => post({ id, type: 'downloadProgress', progress }), dlAbort.signal);
     post({ id, type: 'downloaded' });
   } catch (e) {
     if ((e as DOMException)?.name === 'AbortError') {
@@ -228,14 +229,17 @@ ctx.onmessage = async (e) => {
         dlAbort?.abort();
         return;
       case 'status':
-        post({ id: m.id, type: 'status', downloaded: await store.isDownloaded(), usage: await store.usage(), partial: await store.partialBytes() });
+      {
+        const spec = getModel(m.modelId);
+        post({ id: m.id, type: 'status', downloaded: await store.isDownloaded(spec), usage: await store.usage(spec), partial: await store.partialBytes(spec) });
+      }
         return;
       case 'download':
-        await download(m.id);
+        await download(m.id, m.modelId);
         return;
       case 'deleteModel':
         await releaseAll();
-        await store.deleteAll();
+        await store.deleteModel(getModel(m.modelId));
         post({ id: m.id, type: 'deleted' });
         return;
       case 'generate':
@@ -243,7 +247,7 @@ ctx.onmessage = async (e) => {
         if (busy) throw new EngineError('busy', 'Já existe uma geração em andamento.');
         busy = true;
         try {
-          await generate(m.id, m.prompt, m.seed, m.lowMemory);
+          await generate(m.id, m.modelId, m.prompt, m.seed, m.lowMemory);
         } finally {
           busy = false;
         }

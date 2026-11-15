@@ -5,6 +5,8 @@ export interface GalleryItem {
   prompt: string;
   seed: number;
   date: number;
+  /** modelo usado (ausente em itens antigos, que eram sempre SD-Turbo) */
+  modelId?: string;
 }
 
 const DB = 'atelie-local';

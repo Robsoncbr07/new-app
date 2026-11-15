@@ -34,9 +34,10 @@
     </section>
 
     <section id="model-card" class="card">
+      <h2>Modelo de imagem</h2>
+      <div id="model-picker" class="picker" role="radiogroup" aria-label="Escolha do modelo"></div>
       <div id="model-missing" hidden>
-        <h2>Modelo de imagem</h2>
-        <p class="muted">Baixar modelo (~2,4 GB, só uma vez, use Wi-Fi). Ele fica salvo no aparelho e funciona sem internet depois.</p>
+        <p id="model-missing-text" class="muted small"></p>
         <p id="dl-saved" class="muted small" hidden></p>
         <button id="btn-download" class="btn primary">Baixar modelo</button>
         <p class="hint">Mantenha o app aberto e a tela ligada durante o download.</p>
@@ -51,10 +52,7 @@
       </div>
       <div id="model-ready" hidden>
         <div class="row between">
-          <div>
-            <h2>Modelo pronto</h2>
-            <p id="model-usage" class="muted small"></p>
-          </div>
+          <p id="model-usage" class="muted small"></p>
           <button id="btn-remove" class="link danger">Remover modelo</button>
         </div>
       </div>

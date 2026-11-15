@@ -1,8 +1,9 @@
 import './style.css';
 import { createWorkerEngine } from './engine/client';
 import { createMockEngine } from './engine/mock';
-import { EngineError, type Engine, type DownloadProgress } from './engine/types';
+import { EngineError, type Engine, type DownloadProgress, type ModelStatus } from './engine/types';
 import * as gallery from './gallery';
+import { MODELS, DEFAULT_MODEL, getModel, isModelId, totalSize, type ModelId } from './engine/models';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -21,6 +22,8 @@ const STYLES: { label: string; suffix: string }[] = [
 // ---------- elementos ----------
 const gpuChip = $('gpu-chip');
 const gpuNotice = $('gpu-notice');
+const modelPicker = $('model-picker');
+const modelMissingText = $('model-missing-text');
 const modelMissing = $('model-missing');
 const modelReady = $('model-ready');
 const modelUsage = $('model-usage');
@@ -58,11 +61,23 @@ let busy = false;
 let currentBlob: Blob | null = null;
 let currentName = 'atelie-local';
 let abort: AbortController | null = null;
+const MODEL_KEY = 'atelie-model';
+function loadSelected(): ModelId {
+  try {
+    const v = localStorage.getItem(MODEL_KEY);
+    if (isModelId(v)) return v;
+  } catch { /* ignore */ }
+  return DEFAULT_MODEL;
+}
+let selected: ModelId = loadSelected();
+let downloadingModel: ModelId | null = null;
+const statuses: Partial<Record<ModelId, ModelStatus>> = {};
 
 // ---------- utilidades ----------
 function fmtMB(bytes: number): string {
-  if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(2).replace('.', ',') + ' GB';
-  return Math.round(bytes / 1024 ** 2).toLocaleString('pt-BR') + ' MB';
+  // unidades decimais, como o Android e o Hugging Face mostram (1 GB = 1.000.000.000 bytes)
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(2).replace('.', ',') + ' GB';
+  return Math.round(bytes / 1e6).toLocaleString('pt-BR') + ' MB';
 }
 function randomSeed(): number {
   const a = new Uint32Array(1);
@@ -82,6 +97,7 @@ function refresh() {
   btnVary.disabled = btnGenerate.disabled;
   btnDownload.disabled = downloading;
   btnRemove.disabled = busy;
+  for (const b of modelPicker.querySelectorAll<HTMLButtonElement>('button.opt')) b.disabled = busy || downloading;
 }
 
 // ---------- tela ligada (Wake Lock) ----------
@@ -105,9 +121,9 @@ document.addEventListener('visibilitychange', () => { void syncWakeLock(); });
 
 // ---------- rastro de falha (breadcrumb) ----------
 const CRUMB_KEY = 'atelie-breadcrumb';
-interface Crumb { stage: string; time: string; kind: 'download' | 'generation' }
+interface Crumb { stage: string; time: string; kind: 'download' | 'generation'; model?: string }
 function setCrumb(kind: Crumb['kind'], stage: string) {
-  try { localStorage.setItem(CRUMB_KEY, JSON.stringify({ stage, time: new Date().toISOString(), kind })); } catch { /* ignore */ }
+  try { localStorage.setItem(CRUMB_KEY, JSON.stringify({ stage, time: new Date().toISOString(), kind, model: selected })); } catch { /* ignore */ }
 }
 function clearCrumb() {
   try { localStorage.removeItem(CRUMB_KEY); } catch { /* ignore */ }
@@ -123,11 +139,17 @@ async function diagnosticText(c: Crumb): Promise<string> {
   const lines = [
     `Etapa: ${c.stage}`,
     `Tipo: ${c.kind}`,
+    `Modelo: ${c.model ?? selected}`,
     `Hora: ${c.time}`,
     `userAgent: ${navigator.userAgent}`,
     `deviceMemory: ${mem ?? 'indisponível'}`,
     `Modo econômico: ${lowMemEl.checked ? 'ligado' : 'desligado'}`,
   ];
+  const pm = (performance as any).memory;
+  if (pm) {
+    lines.push(`jsHeapSizeLimit: ${pm.jsHeapSizeLimit}`);
+    lines.push(`usedJSHeapSize: ${pm.usedJSHeapSize}`);
+  }
   try {
     const e = await navigator.storage.estimate();
     lines.push(`Armazenamento: ${fmtMB(e.usage ?? 0)} usados de ${fmtMB(e.quota ?? 0)}`);
@@ -183,22 +205,61 @@ async function detectGPU() {
 }
 
 // ---------- modelo ----------
+function renderPicker() {
+  modelPicker.textContent = '';
+  for (const m of MODELS) {
+    const st = statuses[m.id];
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'opt';
+    b.dataset.model = m.id;
+    b.setAttribute('role', 'radio');
+    b.setAttribute('aria-checked', String(m.id === selected));
+    const head = document.createElement('span');
+    head.className = 'opt-head';
+    const nm = document.createElement('span');
+    nm.textContent = m.id === DEFAULT_MODEL ? `${m.name} (recomendado)` : m.name;
+    const state = document.createElement('span');
+    state.className = 'opt-state';
+    if (st?.downloaded) { state.textContent = 'Baixado'; state.classList.add('ok'); }
+    else if (st && st.partial > 0) state.textContent = 'Download parcial';
+    head.append(nm, state);
+    const sub = document.createElement('small');
+    sub.textContent = `~${fmtMB(totalSize(m))} · ${m.tradeoff}`;
+    b.append(head, sub);
+    b.addEventListener('click', () => selectModel(m.id));
+    modelPicker.appendChild(b);
+  }
+}
+
+function selectModel(id: ModelId) {
+  if (id === selected || busy || downloading) return;
+  selected = id;
+  try { localStorage.setItem(MODEL_KEY, id); } catch { /* ignore */ }
+  modelError.hidden = true;
+  void refreshModel();
+}
+
 async function refreshModel() {
+  const m = getModel(selected);
   try {
-    const s = await engine.status();
+    for (const x of MODELS) statuses[x.id] = await engine.status(x.id);
+    const s = statuses[selected]!;
     downloaded = s.downloaded;
     modelMissing.hidden = downloaded;
     modelReady.hidden = !downloaded;
-    if (downloaded) modelUsage.textContent = `Armazenamento usado: ${fmtMB(s.usage)}`;
+    if (downloaded) modelUsage.textContent = `${m.name}: armazenamento usado ${fmtMB(s.usage)}`;
     const has = !downloaded && s.partial > 0;
+    modelMissingText.textContent = `Baixar o modelo ${m.name} (~${fmtMB(totalSize(m))}, só uma vez, use Wi-Fi). Ele fica salvo no aparelho e funciona sem internet depois.`;
     btnDownload.textContent = has ? 'Continuar download' : 'Baixar modelo';
     dlSaved.hidden = !has;
     btnDiscard.hidden = !has;
-    if (has) dlSaved.textContent = `Já salvo no aparelho: ${fmtMB(s.partial)} de ~2,4 GB. O download continua de onde parou.`;
+    if (has) dlSaved.textContent = `Já salvo no aparelho: ${fmtMB(s.partial)} de ~${fmtMB(totalSize(m))}. O download continua de onde parou.`;
   } catch (e) {
     modelMissing.hidden = false;
     show(modelError, msgOf(e));
   }
+  renderPicker();
   refresh();
 }
 
@@ -207,7 +268,7 @@ function onProgress(p: DownloadProgress) {
   const now = Date.now();
   if (p.file && now - lastCrumb > 1000) {
     lastCrumb = now;
-    setCrumb('download', `Baixando ${p.file} (${fmtMB(p.fileLoaded)} de ${fmtMB(p.fileTotal)})`);
+    setCrumb('download', `Baixando ${getModel(downloadingModel ?? selected).name}: ${p.file} (${fmtMB(p.fileLoaded)} de ${fmtMB(p.fileTotal)})`);
   }
   const pct = p.total ? Math.min(100, (p.loaded / p.total) * 100) : 0;
   dlBar.style.width = pct.toFixed(1) + '%';
@@ -218,8 +279,9 @@ btnDownload.addEventListener('click', async () => {
   if (downloading) return;
   try { await navigator.storage?.persist?.(); } catch { /* ignore */ }
   downloading = true;
+  downloadingModel = selected;
   void syncWakeLock();
-  setCrumb('download', 'Iniciando download');
+  setCrumb('download', `Iniciando download (${getModel(selected).name})`);
   abort = new AbortController();
   modelError.hidden = true;
   btnDownload.hidden = true;
@@ -227,13 +289,14 @@ btnDownload.addEventListener('click', async () => {
   onProgress({ file: '', fileLoaded: 0, fileTotal: 0, loaded: 0, total: 1 });
   refresh();
   try {
-    await engine.download(onProgress, abort.signal);
+    await engine.download(selected, onProgress, abort.signal);
     clearCrumb();
   } catch (e) {
     clearCrumb(); // erro tratado ou pausa: não foi uma morte da página
     if (!(e instanceof EngineError && e.code === 'aborted')) show(modelError, msgOf(e));
   } finally {
     downloading = false;
+    downloadingModel = null;
     void syncWakeLock();
     abort = null;
     dlProgress.hidden = true;
@@ -247,7 +310,7 @@ btnCancel.addEventListener('click', () => abort?.abort());
 btnDiscard.addEventListener('click', async () => {
   if (!confirm('Descartar o que já foi baixado? Será preciso começar do zero.')) return;
   try {
-    await engine.deleteModel();
+    await engine.deleteModel(selected);
   } catch (e) {
     show(modelError, msgOf(e));
   }
@@ -255,9 +318,9 @@ btnDiscard.addEventListener('click', async () => {
 });
 
 btnRemove.addEventListener('click', async () => {
-  if (!confirm('Remover o modelo do aparelho? Será preciso baixar ~2,4 GB de novo para gerar imagens.')) return;
+  if (!confirm(`Remover o modelo ${getModel(selected).name} do aparelho? Será preciso baixar ~${fmtMB(totalSize(getModel(selected)))} de novo para gerar imagens.`)) return;
   try {
-    await engine.deleteModel();
+    await engine.deleteModel(selected);
   } catch (e) {
     show(modelError, msgOf(e));
   }
@@ -322,7 +385,7 @@ async function generate() {
   void syncWakeLock();
   refresh();
   try {
-    const r = await engine.generate({ prompt, seed, lowMemory: lowMemEl.checked }, (s) => {
+    const r = await engine.generate({ modelId: selected, prompt, seed, lowMemory: lowMemEl.checked }, (s) => {
       stageEl.textContent = s;
       setCrumb('generation', s);
     });
@@ -331,11 +394,11 @@ async function generate() {
     currentBlob = blob;
     currentName = `atelie-${seed}`;
     resultEl.hidden = false;
-    elapsedEl.textContent = `Pronto em ${(r.ms / 1000).toFixed(1).replace('.', ',')} s · semente ${seed}`;
+    elapsedEl.textContent = `Pronto em ${(r.ms / 1000).toFixed(1).replace('.', ',')} s · semente ${seed} · ${getModel(selected).name}`;
     stageEl.hidden = true;
     resultEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     try {
-      await gallery.add({ blob, prompt, seed, date: Date.now() });
+      await gallery.add({ blob, prompt, seed, date: Date.now(), modelId: selected });
       await renderGallery();
     } catch {
       /* galeria indisponível (ex.: modo privado): ignora */
@@ -433,7 +496,7 @@ async function renderGallery() {
       canvas.getContext('2d')!.drawImage(bmp, 0, 0);
       bmp.close();
       resultEl.hidden = false;
-      elapsedEl.textContent = `Da galeria · semente ${it.seed} · ${new Date(it.date).toLocaleString('pt-BR')}`;
+      elapsedEl.textContent = `Da galeria · semente ${it.seed} · ${isModelId(it.modelId) ? getModel(it.modelId).name : 'SD-Turbo'} · ${new Date(it.date).toLocaleString('pt-BR')}`;
       resultEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     };
     cell.addEventListener('click', open);

@@ -2,20 +2,21 @@
 import type { Engine, GenerateResult } from './types';
 import { EngineError } from './types';
 import { mulberry32 } from './scheduler';
+import { getModel, totalSize, type ModelId } from './models';
 
-const KEY = 'atelie-mock-downloaded';
+const key = (id: ModelId) => `atelie-mock-downloaded-${id}`;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export function createMockEngine(): Engine {
-  const get = () => {
-    try { return localStorage.getItem(KEY) === '1'; } catch { return false; }
+  const get = (id: ModelId) => {
+    try { return localStorage.getItem(key(id)) === '1'; } catch { return false; }
   };
   return {
-    async status() {
-      return { downloaded: get(), usage: get() ? 2420 * 1024 * 1024 : 0, partial: 0 };
+    async status(id) {
+      return { downloaded: get(id), usage: get(id) ? totalSize(getModel(id)) : 0, partial: 0 };
     },
-    async download(onProgress, signal) {
-      const total = 2420 * 1024 * 1024;
+    async download(id, onProgress, signal) {
+      const total = totalSize(getModel(id));
       const steps = 15;
       for (let i = 1; i <= steps; i++) {
         await sleep(100);
@@ -23,15 +24,16 @@ export function createMockEngine(): Engine {
         const loaded = Math.round((total * i) / steps);
         onProgress({ file: 'mock', fileLoaded: loaded, fileTotal: total, loaded, total });
       }
-      try { localStorage.setItem(KEY, '1'); } catch { /* ignore */ }
+      try { localStorage.setItem(key(id), '1'); } catch { /* ignore */ }
     },
     async generate(req, onStage): Promise<GenerateResult> {
       const t0 = performance.now();
-      onStage('Lendo o prompt…');
+      const n = getModel(req.modelId).name;
+      onStage(`${n}: Lendo o prompt…`);
       await sleep(150);
-      onStage('Criando a imagem…');
+      onStage(`${n}: Criando a imagem…`);
       await sleep(250);
-      onStage('Decodificando a imagem…');
+      onStage(`${n}: Decodificando a imagem…`);
       await sleep(100);
       const w = 512, h = 512;
       const rand = mulberry32(req.seed >>> 0);
@@ -54,8 +56,8 @@ export function createMockEngine(): Engine {
       }
       return { rgba, width: w, height: h, ms: Math.round(performance.now() - t0) };
     },
-    async deleteModel() {
-      try { localStorage.removeItem(KEY); } catch { /* ignore */ }
+    async deleteModel(id) {
+      try { localStorage.removeItem(key(id)); } catch { /* ignore */ }
     },
   };
 }

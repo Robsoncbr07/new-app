@@ -1,3 +1,5 @@
+import type { ModelId } from './models';
+
 export interface DownloadProgress {
   file: string;
   fileLoaded: number;
@@ -14,6 +16,7 @@ export interface ModelStatus {
 }
 
 export interface GenerateRequest {
+  modelId: ModelId;
   prompt: string;
   seed: number;
   lowMemory: boolean;
@@ -29,10 +32,10 @@ export interface GenerateResult {
 
 /** Mesma interface para o motor real (worker) e o mock. */
 export interface Engine {
-  status(): Promise<ModelStatus>;
-  download(onProgress: (p: DownloadProgress) => void, signal: AbortSignal): Promise<void>;
+  status(modelId: ModelId): Promise<ModelStatus>;
+  download(modelId: ModelId, onProgress: (p: DownloadProgress) => void, signal: AbortSignal): Promise<void>;
   generate(req: GenerateRequest, onStage: (label: string) => void): Promise<GenerateResult>;
-  deleteModel(): Promise<void>;
+  deleteModel(modelId: ModelId): Promise<void>;
 }
 
 /** Erro com mensagem já em português, pronto para exibir. */
@@ -46,11 +49,11 @@ export class EngineError extends Error {
 
 export type WorkerRequest =
   | { id: number; type: 'init'; ortBase: string }
-  | { id: number; type: 'status' }
-  | { id: number; type: 'download' }
+  | { id: number; type: 'status'; modelId: ModelId }
+  | { id: number; type: 'download'; modelId: ModelId }
   | { id: number; type: 'cancelDownload' }
-  | { id: number; type: 'generate'; prompt: string; seed: number; lowMemory: boolean }
-  | { id: number; type: 'deleteModel' };
+  | { id: number; type: 'generate'; modelId: ModelId; prompt: string; seed: number; lowMemory: boolean }
+  | { id: number; type: 'deleteModel'; modelId: ModelId };
 
 export type WorkerReply =
   | { id: number; type: 'status'; downloaded: boolean; usage: number; partial: number }

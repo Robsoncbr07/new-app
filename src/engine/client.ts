@@ -1,7 +1,10 @@
 import type {
   Engine, WorkerReply, WorkerRequest, DownloadProgress, GenerateRequest, GenerateResult, ModelStatus,
 } from './types';
+import type { ModelId } from './models';
 import { EngineError } from './types';
+
+type Req = WorkerRequest extends infer T ? (T extends { id: number } ? Omit<T, 'id'> : never) : never;
 
 type Pending = {
   resolve: (v: any) => void;
@@ -40,7 +43,7 @@ export function createWorkerEngine(): Engine {
     pending.clear();
   };
 
-  const call = <T>(msg: Omit<WorkerRequest, 'id'>, extra: Partial<Pending> = {}) =>
+  const call = <T>(msg: Req, extra: Partial<Pending> = {}) =>
     new Promise<T>((resolve, reject) => {
       const id = nextId++;
       pending.set(id, { resolve, reject, ...extra });
@@ -51,16 +54,16 @@ export function createWorkerEngine(): Engine {
   send({ type: 'init', ortBase, id: 0 } as WorkerRequest);
 
   return {
-    async status(): Promise<ModelStatus> {
-      const r = await call<{ downloaded: boolean; usage: number; partial: number }>({ type: 'status' });
+    async status(modelId: ModelId): Promise<ModelStatus> {
+      const r = await call<{ downloaded: boolean; usage: number; partial: number }>({ type: 'status', modelId });
       return { downloaded: r.downloaded, usage: r.usage, partial: r.partial };
     },
-    download(onProgress, signal) {
+    download(modelId, onProgress, signal) {
       return new Promise<void>((resolve, reject) => {
         const id = nextId++;
         pending.set(id, { resolve: () => resolve(), reject, onProgress });
         signal.addEventListener('abort', () => send({ type: 'cancelDownload', id: 0 } as WorkerRequest), { once: true });
-        send({ type: 'download', id } as WorkerRequest);
+        send({ type: 'download', modelId, id } as WorkerRequest);
       });
     },
     async generate(req: GenerateRequest, onStage): Promise<GenerateResult> {
@@ -69,8 +72,8 @@ export function createWorkerEngine(): Engine {
       );
       return { rgba: new Uint8ClampedArray(r.rgba), width: r.width, height: r.height, ms: r.ms };
     },
-    async deleteModel() {
-      await call({ type: 'deleteModel' });
+    async deleteModel(modelId: ModelId) {
+      await call({ type: 'deleteModel', modelId });
     },
   };
 }

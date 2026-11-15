@@ -3,38 +3,16 @@
 import type { DownloadProgress } from './types';
 import { EngineError } from './types';
 
-export const BASE_URL = 'https://huggingface.co/schmuell/sd-turbo-ort-web/resolve/main/';
-
-export interface ModelFile {
-  /** nome do arquivo no OPFS */
-  name: string;
-  /** caminho remoto relativo a BASE_URL */
-  remote: string;
-  /** tamanho aproximado em bytes (usado só até o Content-Length real chegar) */
-  approx: number;
-}
+import { totalSize, type ModelFile, type ModelSpec } from './models';
 
 const MB = 1024 * 1024;
-export const FILES: ModelFile[] = [
-  { name: 'text_encoder.onnx', remote: 'text_encoder/model.onnx', approx: 1700 * MB },
-  { name: 'unet.onnx', remote: 'unet/model.onnx', approx: 640 * MB },
-  { name: 'vae_decoder.onnx', remote: 'vae_decoder/model.onnx', approx: 95 * MB },
-];
-
 const DIR = 'atelie-modelos';
 
-async function dir(): Promise<FileSystemDirectoryHandle> {
+/** Pasta do modelo: a raiz (SD-Turbo, como nas versões antigas) ou uma subpasta. */
+async function dir(m: ModelSpec): Promise<FileSystemDirectoryHandle> {
   const root = await navigator.storage.getDirectory();
-  return root.getDirectoryHandle(DIR, { create: true });
-}
-
-async function exists(d: FileSystemDirectoryHandle, name: string): Promise<boolean> {
-  try {
-    await d.getFileHandle(name);
-    return true;
-  } catch {
-    return false;
-  }
+  const base = await root.getDirectoryHandle(DIR, { create: true });
+  return m.dir ? base.getDirectoryHandle(m.dir, { create: true }) : base;
 }
 
 async function sizeOf(d: FileSystemDirectoryHandle, name: string): Promise<number> {
@@ -45,20 +23,19 @@ async function sizeOf(d: FileSystemDirectoryHandle, name: string): Promise<numbe
   }
 }
 
-/** Um arquivo só é "completo" se existir sob o nome final (nunca como .part). */
-export async function isDownloaded(): Promise<boolean> {
-  const d = await dir();
-  for (const f of FILES) {
-    if (!(await exists(d, f.name))) return false;
-    if ((await sizeOf(d, f.name)) < 1024 * 1024) return false;
+/** Um arquivo só é "completo" se existir sob o nome final com exatamente o tamanho esperado. */
+export async function isDownloaded(m: ModelSpec): Promise<boolean> {
+  const d = await dir(m);
+  for (const f of m.files) {
+    if ((await sizeOf(d, f.name)) !== f.size) return false;
   }
   return true;
 }
 
-export async function usage(): Promise<number> {
-  const d = await dir();
+export async function usage(m: ModelSpec): Promise<number> {
+  const d = await dir(m);
   let total = 0;
-  for (const f of FILES) {
+  for (const f of m.files) {
     total += await sizeOf(d, f.name);
     total += await sizeOf(d, f.name + '.part');
   }
@@ -66,25 +43,45 @@ export async function usage(): Promise<number> {
 }
 
 /** Bytes já salvos em arquivos .part (download interrompido que pode continuar). */
-export async function partialBytes(): Promise<number> {
-  const d = await dir();
+export async function partialBytes(m: ModelSpec): Promise<number> {
+  const d = await dir(m);
   let total = 0;
-  for (const f of FILES) total += await sizeOf(d, f.name + '.part');
+  for (const f of m.files) total += await sizeOf(d, f.name + '.part');
   return total;
 }
 
-export async function deleteAll(): Promise<void> {
+/** Apaga só os arquivos deste modelo (o outro modelo, se baixado, não é tocado). */
+export async function deleteModel(m: ModelSpec): Promise<void> {
   const root = await navigator.storage.getDirectory();
+  let base: FileSystemDirectoryHandle;
   try {
-    await root.removeEntry(DIR, { recursive: true });
+    base = await root.getDirectoryHandle(DIR);
   } catch (e) {
-    if ((e as DOMException).name !== 'NotFoundError') throw e;
+    if ((e as DOMException).name === 'NotFoundError') return;
+    throw e;
+  }
+  if (m.dir) {
+    try {
+      await base.removeEntry(m.dir, { recursive: true });
+    } catch (e) {
+      if ((e as DOMException).name !== 'NotFoundError') throw e;
+    }
+    return;
+  }
+  for (const f of m.files) {
+    for (const n of [f.name, f.name + '.part']) {
+      try {
+        await base.removeEntry(n);
+      } catch (e) {
+        if ((e as DOMException).name !== 'NotFoundError') throw e;
+      }
+    }
   }
 }
 
 /** Lê um arquivo inteiro para memória (necessário para criar a sessão ORT). */
-export async function readFile(name: string): Promise<Uint8Array> {
-  const d = await dir();
+export async function readFile(m: ModelSpec, name: string): Promise<Uint8Array> {
+  const d = await dir(m);
   const fh = await d.getFileHandle(name);
   const access = await (fh as any).createSyncAccessHandle();
   try {
@@ -154,9 +151,9 @@ function totalOf(resp: Response, offset: number): number {
   return resp.status === 206 ? offset + cl : cl;
 }
 
-async function request(f: ModelFile, offset: number, signal: AbortSignal): Promise<Response> {
+async function request(m: ModelSpec, f: ModelFile, offset: number, signal: AbortSignal): Promise<Response> {
   try {
-    return await fetch(BASE_URL + f.remote, { signal, headers: offset > 0 ? { Range: `bytes=${offset}-` } : {} });
+    return await fetch(m.baseUrl + f.remote, { signal, headers: offset > 0 ? { Range: `bytes=${offset}-` } : {} });
   } catch (e) {
     if ((e as DOMException).name === 'AbortError') throw e;
     throw new EngineError('download', 'Falha ao baixar o modelo. Verifique sua conexão e tente novamente: o download continua de onde parou.');
@@ -164,26 +161,35 @@ async function request(f: ModelFile, offset: number, signal: AbortSignal): Promi
 }
 
 async function downloadOne(
+  m: ModelSpec,
   d: FileSystemDirectoryHandle,
   f: ModelFile,
   doneBefore: number,
-  grandTotalApprox: number,
+  grandTotal: number,
   onProgress: (p: DownloadProgress) => void,
   signal: AbortSignal,
 ): Promise<number> {
   const partName = f.name + '.part';
   let offset = await sizeOf(d, partName);
-  let resp = await request(f, offset, signal);
+  if (offset === f.size) { // baixado por inteiro, só faltava renomear
+    await finalize(d, f.name);
+    return offset;
+  }
+  if (offset > f.size) { // parcial impossível: descarta
+    await d.removeEntry(partName).catch(() => undefined);
+    offset = 0;
+  }
+  let resp = await request(m, f, offset, signal);
   if (resp.status === 416) {
     // Parcial suspeito. Se o tamanho dele já é o total, só falta finalizar; senão recomeça do zero.
-    const m = /\*\/(\d+)/.exec(resp.headers.get('Content-Range') ?? '');
-    if (m && offset > 0 && parseInt(m[1], 10) === offset) {
+    const cr = /\*\/(\d+)/.exec(resp.headers.get('Content-Range') ?? '');
+    if (cr && offset > 0 && parseInt(cr[1], 10) === offset) {
       await finalize(d, f.name);
       return offset;
     }
     await d.removeEntry(partName).catch(() => undefined);
     offset = 0;
-    resp = await request(f, 0, signal);
+    resp = await request(m, f, 0, signal);
   }
   if (!resp.ok || !resp.body) {
     throw new EngineError('download', `Falha ao baixar o modelo (HTTP ${resp.status}). Tente novamente mais tarde.`);
@@ -191,7 +197,10 @@ async function downloadOne(
   const resume = resp.status === 206 && offset > 0;
   if (!resume) offset = 0; // 200: o servidor ignorou o Range; recomeça do zero
   const total = totalOf(resp, offset);
-  const fileTotal = total || f.approx;
+  if (total && total !== f.size) {
+    throw new EngineError('download', 'O arquivo no servidor tem um tamanho diferente do esperado. Tente novamente mais tarde.');
+  }
+  const fileTotal = f.size;
 
   const partFh = await d.getFileHandle(partName, { create: true });
   const access = await (partFh as any).createSyncAccessHandle();
@@ -203,7 +212,7 @@ async function downloadOne(
     fileLoaded: written,
     fileTotal,
     loaded: doneBefore + written,
-    total: Math.max(grandTotalApprox, doneBefore + fileTotal),
+    total: grandTotal,
   });
   try {
     if (!resume) access.truncate(0);
@@ -233,31 +242,33 @@ async function downloadOne(
     access.close();
   }
 
-  if (total ? written !== total : written < f.approx * 0.5) {
+  if (written !== f.size) {
     throw new EngineError('download', 'Download incompleto. Toque em "Continuar download" para tentar de novo.');
   }
   await finalize(d, f.name);
   onProgress({
     file: f.name, fileLoaded: written, fileTotal: written,
-    loaded: doneBefore + written, total: Math.max(grandTotalApprox, doneBefore + written),
+    loaded: doneBefore + written, total: grandTotal,
   });
   return written;
 }
 
 export async function download(
+  m: ModelSpec,
   onProgress: (p: DownloadProgress) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const d = await dir();
-  const approxTotal = FILES.reduce((s, f) => s + f.approx, 0);
+  const d = await dir(m);
+  const grandTotal = totalSize(m);
   let done = 0;
-  for (const f of FILES) {
+  for (const f of m.files) {
     if (signal.aborted) throw new DOMException('Cancelado', 'AbortError');
     const existing = await sizeOf(d, f.name);
-    if (existing >= 1024 * 1024 && (await exists(d, f.name))) {
+    if (existing === f.size) {
       done += existing; // já completo
       continue;
     }
-    done += await downloadOne(d, f, done, approxTotal, onProgress, signal);
+    if (existing > 0) await d.removeEntry(f.name).catch(() => undefined); // arquivo final com tamanho errado: refaz
+    done += await downloadOne(m, d, f, done, grandTotal, onProgress, signal);
   }
 }
